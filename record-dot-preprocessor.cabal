@@ -40,7 +40,8 @@ library
         base >= 4.8 && < 5,
         uniplate,
         ghc >=8.6 && <9.9,
-        extra
+        extra,
+        directory
     exposed-modules:
         RecordDotPreprocessor
         RecordDotPreprocessor.Lib
@@ -57,7 +58,8 @@ executable record-dot-preprocessor
     ghc-options:        -main-is Preprocessor
     build-depends:
         base >= 4.8 && < 5,
-        extra
+        extra,
+        directory
     other-modules:
         Edit
         Lexer

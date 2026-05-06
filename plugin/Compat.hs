@@ -54,6 +54,14 @@ import GHC.Types.PkgQual (RawPkgQual(NoRawPkgQual))
 #endif
 import Data.IORef as Compat
 
+#if __GLASGOW_HASKELL__ >= 900
+import GHC.Utils.Outputable (Outputable, ppr, showSDocUnsafe)
+#elif __GLASGOW_HASKELL__ >= 808
+import Outputable (Outputable, ppr, showSDocUnsafe)
+#else
+import Outputable (Outputable, ppr, showSDoc)
+#endif
+
 ---------------------------------------------------------------------
 -- LOCATIONS
 
@@ -309,4 +317,15 @@ isLHsForAllTy _                     = False
 #if __GLASGOW_HASKELL__ >= 904
 rdrNameFieldOcc :: FieldOcc GhcPs -> LocatedN RdrName
 rdrNameFieldOcc = foLabel
+#endif
+
+---------------------------------------------------------------------
+-- SHOW PPR (for dumping instances)
+
+#if __GLASGOW_HASKELL__ >= 808
+showPpr :: Outputable a => a -> String
+showPpr = showSDocUnsafe . ppr
+#else
+showPpr :: Outputable a => a -> String
+showPpr = showSDoc . ppr
 #endif

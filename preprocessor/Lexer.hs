@@ -58,7 +58,7 @@ reposition = go
 -- we ignore numbers entirely because they don't have any impact on what we want to do
 lexerLexeme :: String -> (String, String)
 lexerLexeme ('\'':x:'\'':xs) = (['\'',x,'\''], xs)
-lexerLexeme ('\'':x:xs) | x /= '\'' = ("\'", x:xs) -- might be a data kind, see #25
+lexerLexeme ('\'':x:xs) | x /= '\'' && x /= '\\' = ("\'", x:xs) -- might be a data kind, see #25 (but not '\..' escape — fall through to the quoted-loop case)
 lexerLexeme (open:xs) | open == '\'' || open == '\"' = seen [open] $ go xs
     where
         go (x:xs) | x == open = ([x], xs)

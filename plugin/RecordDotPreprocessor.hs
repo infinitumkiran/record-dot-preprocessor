@@ -6,10 +6,16 @@
 -- | Module containing the plugin.
 module RecordDotPreprocessor(plugin) where
 
+import Control.Monad (when)
 import Data.Generics.Uniplate.Data
 import Data.List.Extra
 import Data.Tuple.Extra
-import Compat
+import Data.Maybe (isJust)
+import System.Environment
+import System.IO
+import System.IO.Unsafe (unsafePerformIO)
+import Compat hiding (showPpr)
+import Compat (showPpr)
 import qualified GHC
 #if __GLASGOW_HASKELL__ > 901
 import qualified GHC.Types.SourceText as GHC
@@ -38,6 +44,33 @@ import qualified Data.List.NonEmpty as NE
 ---------------------------------------------------------------------
 -- PLUGIN WRAPPER
 
+-- | Check if dump mode is enabled via environment variable
+{-# NOINLINE dumpInstancesEnabled #-}
+dumpInstancesEnabled :: Bool
+dumpInstancesEnabled = unsafePerformIO $ do
+    val <- lookupEnv "RECORD_DOT_DUMP_INSTANCES"
+    return $ isJust val
+
+-- | Check if dump directory is set via environment variable
+{-# NOINLINE dumpDirectory #-}
+dumpDirectory :: String
+dumpDirectory = unsafePerformIO $ do
+    val <- lookupEnv "RECORD_DOT_DUMP_DIR"
+    return $ case val of
+        Just d  -> d
+        Nothing -> "."
+
+-- | Dump an instance to a file
+{-# NOINLINE dumpInstance #-}
+dumpInstance :: String -> String -> ()
+dumpInstance modName inst = unsafePerformIO $ do
+    when dumpInstancesEnabled $ do
+        let filename = dumpDirectory ++ "/" ++ modName ++ ".dump-rdp"
+        withFile filename AppendMode $ \h -> do
+            hPutStrLn h inst
+            hPutStrLn h ""
+    return ()
+
 -- | GHC plugin.
 plugin :: GHC.Plugin
 plugin = GHC.defaultPlugin
@@ -59,6 +92,7 @@ plugin = GHC.defaultPlugin
             uniqSupplyRef <- GHC.liftIO $ newIORef uniqSupply
             let ?hscenv = hscenv
             let ?uniqSupply = uniqSupplyRef
+            let ?dumpEnabled = dumpInstancesEnabled
             pure x{GHC.hpm_module = onModule <$> GHC.hpm_module x}
 
 ---------------------------------------------------------------------
@@ -185,9 +219,21 @@ instanceTemplate selector record field = ClsInstD noE $ ClsInstDecl
         vX = GHC.mkRdrUnqual $ GHC.mkVarOcc "x"
 
 
+-- | Serialize an instance to a string representation for dumping
+serializeInstance :: FieldOcc GhcPs -> HsType GhcPs -> HsType GhcPs -> String
+serializeInstance selector record field =
+    let fieldName = GHC.occNameString $ GHC.occName $ unLoc $ rdrNameFieldOcc selector
+        recordName = showPpr record
+        fieldType = showPpr field
+    in "instance HasField \"" ++ fieldName ++ "\" " ++ recordName ++ " " ++ fieldType ++ " where\n" ++
+       "    hasField r = (\\x -> r{" ++ fieldName ++ "=x}, " ++ fieldName ++ " r)"
+
 onDecl :: PluginEnv => Maybe GHC.ModuleName -> LHsDecl GhcPs -> [LHsDecl GhcPs]
 onDecl modName o@(L _ (GHC.TyClD _ x)) = o :
-    [ noL $ InstD noE $ instanceTemplate field (unLoc record) (unbang typ)
+    [ let inst = instanceTemplate field (unLoc record) (unbang typ)
+          instStr = serializeInstance field (unLoc record) (unbang typ)
+          modNameStr = maybe "Unknown" GHC.moduleNameString modName
+      in seq (dumpInstance modNameStr instStr) $ noL $ InstD noE inst
     | let fields = nubOrdOn (\(_,_,x,_) -> mkNonDetFastString $ GHC.occNameFS $ GHC.rdrNameOcc $ unLoc $ rdrNameFieldOcc x) $ getFields modName x
     , (record, _, field, typ) <- fields]
 onDecl _ x = [descendBi onExp x]

@@ -8,11 +8,16 @@ import Data.Maybe
 import Data.Char
 import Data.List.Extra
 import Control.Monad.Extra
+import System.Directory
+import System.Environment
+import System.IO
+import System.IO.Unsafe (unsafePerformIO)
 
 recordDotPreprocessor :: FilePath -> String -> String
 recordDotPreprocessor original = unlexerFile (Just original) . unparens . edit . parens . lexer
     where
         edit :: [PL] -> [PL]
+        -- Transform record updates AND generate HasField instances
         edit = editAddPreamble . editAddInstances . editLoop
 
 recordDotPreprocessorOnFragment :: String -> String
@@ -84,13 +89,27 @@ makeField :: [String] -> String
 makeField [x] = "@" ++ show x
 makeField xs = "@'(" ++ intercalate "," (map show xs) ++ ")"
 
+-- | Build chained getField application:
+--   chainGetField [f1,f2,f3] e  ==>  Z.getField @"f3" (Z.getField @"f2" (Z.getField @"f1" e))
+chainGetField :: [String] -> PL -> PL
+chainGetField fs e = foldl step e fs
+  where
+    step expr f = paren [spc $ mkPL "Z.getField", spc $ mkPL ("@" ++ show f), expr]
+
 
 ---------------------------------------------------------------------
 -- PREAMBLE
 
+-- | Check if content contains already-transformed marker
+hasBeenTransformed :: [PL] -> Bool
+hasBeenTransformed xs =
+    any (isPL "_recordDotPreprocessorUnused") xs ||
+    any (\x -> let w = getWhite x in "LINE 1 \"/home/kiransai-abhishek/repos/euler-api-gateway" `isInfixOf` w) xs
+
 -- | Add the necessary extensions, imports and local definitions
 editAddPreamble :: [PL] -> [PL]
 editAddPreamble o@xs
+    | hasBeenTransformed xs = o
     | (premodu, modu:modname@xs) <- break (isPL "module") xs
     , (prewhr, whr:xs) <- break (isPL "where") xs
     = nl (mkPL prefix) : premodu ++ modu : prewhr ++ whr : nl (mkPL "") : nl (mkPL imports) : xs ++ [nl $ mkPL "", nl $ mkPL $ trailing modname]
@@ -125,10 +144,13 @@ editLoop :: [PL] -> [PL]
 --  Leave quasiquotations alone
 editLoop (p : ps) | isQuasiQuotation p = p : editLoop ps
 
--- | a.b.c ==> getField @'(b,c) a
+-- Record access (a.b.c) ==> getField @'(b,c) a
+-- Record updates (e{b.c=d}) ==> setField @'(b,c) d
+
+-- | a.b.c ==> Z.getField @"c" (Z.getField @"b" a)
 editLoop (NoW e : (spanFields -> (fields@(_:_), whitespace, rest)))
     | not $ isCtor e
-    = editLoop $ addWhite whitespace (paren [spc $ mkPL "Z.getField", spc $ mkPL $ makeField fields, e]) : rest
+    = editLoop $ addWhite whitespace (chainGetField fields e) : rest
 
 -- (.a.b) ==> (getField @'(a,b))
 editLoop (Paren start@(L "(") (spanFields -> (fields@(_:_), whitespace, [])) end:xs)
@@ -187,9 +209,38 @@ renderUpdate (Update e upd) = case unsnoc upd of
 ---------------------------------------------------------------------
 -- INSTANCES
 
+-- | Check if dump mode is enabled via environment variable
+{-# NOINLINE dumpInstancesEnabled #-}
+dumpInstancesEnabled :: Bool
+dumpInstancesEnabled = unsafePerformIO $ do
+    val <- lookupEnv "RECORD_DOT_DUMP_INSTANCES"
+    return $ isJust val
+
+-- | Check if dump directory is set via environment variable
+{-# NOINLINE dumpDirectory #-}
+dumpDirectory :: String
+dumpDirectory = unsafePerformIO $ do
+    val <- lookupEnv "RECORD_DOT_DUMP_DIR"
+    return $ case val of
+        Just d  -> d
+        Nothing -> "."
+
+-- | Dump an instance to a file
+{-# NOINLINE dumpInstance #-}
+dumpInstance :: String -> String -> ()
+dumpInstance modName inst = unsafePerformIO $ do
+    when dumpInstancesEnabled $ do
+        createDirectoryIfMissing True dumpDirectory
+        let filename = dumpDirectory ++ "/" ++ modName ++ ".dump-rdp"
+        withFile filename AppendMode $ \h -> do
+            hPutStrLn h inst
+            hPutStrLn h ""
+    return ()
+
 editAddInstances :: [PL] -> [PL]
 editAddInstances xs = xs ++ concatMap (\x -> [nl $ mkPL "", mkPL x])
-    [ "instance (aplg ~ (" ++ ftyp ++ ")) => Z.HasField \"" ++ fname ++ "\" " ++ rtyp ++ " aplg " ++
+    [ seq (dumpInstance modNameStr instStr) $
+      "instance (aplg ~ (" ++ ftyp ++ ")) => Z.HasField \"" ++ fname ++ "\" " ++ rtyp ++ " aplg " ++
       "where hasField _r = (\\_x -> case _r of {" ++ intercalate " ; "
         [ if fname `elem` map fst fields then
             "(" ++ cname ++ " " ++
@@ -208,11 +259,22 @@ editAddInstances xs = xs ++ concatMap (\x -> [nl $ mkPL "", mkPL x])
             cname ++ "{} -> Prelude.error " ++ show ("Cannot get " ++ msg cname)
         | Ctor cname fields <- ctors] ++
       "})"
-    | Record rname rargs ctors <- parseRecords xs
+    | Record rname rargs ctors <- records
     , let rtyp = "(" ++ unwords (rname : rargs) ++ ")"
     , (fname, ftyp) <- nubOrd $ concatMap ctorFields ctors
     , let msg cname = "field " ++ show fname ++ " of type " ++ show rname ++ " with constructor " ++ show cname
+    , let modNameStr = "UnknownModule"
+    , let instStr = "instance (aplg ~ (" ++ ftyp ++ ")) => Z.HasField \"" ++ fname ++ "\" " ++ rtyp ++ " aplg where\n" ++
+                      "    hasField _r = (\\_x -> case _r of {" ++ intercalate " ; "
+                        [ if fname `elem` map fst fields then
+                            "(" ++ cname ++ " " ++ unwords ["_" | _ <- fields] ++ ") -> " ++ cname ++ " " ++
+                                unwords [if fst field == fname then "_x" else "_" | field <- fields]
+                          else ""
+                        | Ctor cname fields <- ctors, fname `elem` map fst fields] ++
+                      "}, " ++ fname ++ " _r)"
     ]
+    where
+        records = parseRecords xs
 
 -- | Represent a record, ignoring constructors. For example:
 --
