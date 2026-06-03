@@ -13,12 +13,38 @@ import System.Environment
 import System.IO
 import System.IO.Unsafe (unsafePerformIO)
 
-recordDotPreprocessor :: FilePath -> String -> String
-recordDotPreprocessor original = unlexerFile (Just original) . unparens . edit . parens . lexer
+-- | Run the preprocessor. When @noHasField@ is 'True', the dot-syntax rewrites
+--   and preamble are still emitted, but ALL generated @Z.HasField@ instances are
+--   omitted (controlled by the @--no-hasfield@ command-line flag, see "Preprocessor").
+--
+--   Independently of that flag, HasField is never generated for types carrying a
+--   large-records annotation (@{-# ANN type T ...largeRecord... #-}@): the
+--   large-records plugin already generates those, and emitting them here too
+--   produces duplicate-instance errors.
+recordDotPreprocessor :: Bool -> FilePath -> String -> String
+recordDotPreprocessor noHasField original src =
+    (unlexerFile (Just original) . unparens . edit . parens . lexer) src
     where
         edit :: [PL] -> [PL]
-        -- Transform record updates AND generate HasField instances
-        edit = editAddPreamble . editAddInstances . editLoop
+        -- Transform record updates AND (unless disabled) generate HasField instances
+        edit = editAddPreamble isBoot . addInstances . editLoop
+        addInstances = if noHasField then id else editAddInstances (scanLargeRecord src)
+        -- hs-boot files may contain declarations only (no value bindings), so the
+        -- generated _recordDotPreprocessorUnused must be signature-only there.
+        isBoot = "-boot" `isSuffixOf` original
+
+-- | Type names annotated with a large-records pragma, e.g.
+--   @{-# ANN type Foo Nau.largeRecord #-}@. Scanned from raw source lines so it
+--   is independent of how the pragma is lexed.
+scanLargeRecord :: String -> [String]
+scanLargeRecord = concatMap fromLine . lines
+  where
+    fromLine line
+      | "largeRecord" `isInfixOf` line
+      , ("ANN":"type":name:_) <- dropWhile (/= "ANN") (words (map declutter line))
+      = [name]
+      | otherwise = []
+    declutter c = if c `elem` ("{}#" :: String) then ' ' else c
 
 recordDotPreprocessorOnFragment :: String -> String
 recordDotPreprocessorOnFragment = unlexerFile Nothing . unparens . editLoop . parens . lexer
@@ -107,8 +133,8 @@ hasBeenTransformed xs =
     any (\x -> let w = getWhite x in "LINE 1 \"/home/kiransai-abhishek/repos/euler-api-gateway" `isInfixOf` w) xs
 
 -- | Add the necessary extensions, imports and local definitions
-editAddPreamble :: [PL] -> [PL]
-editAddPreamble o@xs
+editAddPreamble :: Bool -> [PL] -> [PL]
+editAddPreamble isBoot o@xs
     | hasBeenTransformed xs = o
     | (premodu, modu:modname@xs) <- break (isPL "module") xs
     , (prewhr, whr:xs) <- break (isPL "where") xs
@@ -121,11 +147,15 @@ editAddPreamble o@xs
                  -- it's too hard to avoid generating excessive brackets, so just ignore the code
                  -- only really applies to people using it through Haskell Language Server (see #37)
                  "{- HLINT ignore \"Redundant bracket\" -}"
-        imports = "import qualified GHC.Records.Extra as Z"
+        -- Also import Prelude qualified: the (NoImplicitPrelude) modules we process
+        -- use Prelude.error/Prelude.any/Prelude.== etc. that would otherwise be out of scope.
+        imports = "import qualified GHC.Records.Extra as Z; import qualified Prelude"
         -- if you import two things that have preprocessor_unused, and export them as modules, you don't want them to clash
-        trailing modName = "_recordDotPreprocessorUnused" ++ uniq ++ " :: Z.HasField \"\" r a => r -> a;" ++
-                           "_recordDotPreprocessorUnused" ++ uniq ++ " = Z.getField @\"\""
-            where uniq = filter isAlphaNum $ concat $ take 19 $ takeWhile modPart $ map lexeme $ unparens modName
+        trailing modName
+            | isBoot    = sig                       -- hs-boot: signature only, no binding
+            | otherwise = sig ++ ";" ++ "_recordDotPreprocessorUnused" ++ uniq ++ " = Z.getField @\"\""
+            where sig  = "_recordDotPreprocessorUnused" ++ uniq ++ " :: Z.HasField \"\" r a => r -> a"
+                  uniq = filter isAlphaNum $ concat $ take 19 $ takeWhile modPart $ map lexeme $ unparens modName
         modPart x = x == "." || all isUpper (take 1 x)
 
 
@@ -237,8 +267,14 @@ dumpInstance modName inst = unsafePerformIO $ do
             hPutStrLn h ""
     return ()
 
-editAddInstances :: [PL] -> [PL]
-editAddInstances xs = xs ++ concatMap (\x -> [nl $ mkPL "", mkPL x])
+-- | Does a field type begin with an explicit @forall@ (a RankN / polymorphic
+--   field)? Such fields cannot have a 'Z.HasField' instance — the instance
+--   would require @aplg ~ (forall a. ...)@, which GHC rejects (impredicativity).
+isRankNFieldType :: String -> Bool
+isRankNFieldType t = "forall" `isPrefixOf` dropWhile isSpace t
+
+editAddInstances :: [String] -> [PL] -> [PL]
+editAddInstances largeRecordNames xs = xs ++ concatMap (\x -> [nl $ mkPL "", mkPL x])
     [ seq (dumpInstance modNameStr instStr) $
       "instance (aplg ~ (" ++ ftyp ++ ")) => Z.HasField \"" ++ fname ++ "\" " ++ rtyp ++ " aplg " ++
       "where hasField _r = (\\_x -> case _r of {" ++ intercalate " ; "
@@ -260,8 +296,15 @@ editAddInstances xs = xs ++ concatMap (\x -> [nl $ mkPL "", mkPL x])
         | Ctor cname fields <- ctors] ++
       "})"
     | Record rname rargs ctors <- records
+    , rname `notElem` largeRecordNames
     , let rtyp = "(" ++ unwords (rname : rargs) ++ ")"
     , (fname, ftyp) <- nubOrd $ concatMap ctorFields ctors
+    -- Skip HasField for RankN / polymorphic fields (e.g.
+    -- @callCounter :: forall a. ToJSON a => (Text, a) -> IO ()@): a
+    -- @HasField@ instance would need @aplg ~ (forall a. ...)@, which GHC
+    -- rejects as an illegal polymorphic type (impredicativity). Such fields
+    -- can't be dot-accessed anyway; use the record selector directly.
+    , not (isRankNFieldType ftyp)
     , let msg cname = "field " ++ show fname ++ " of type " ++ show rname ++ " with constructor " ++ show cname
     , let modNameStr = "UnknownModule"
     , let instStr = "instance (aplg ~ (" ++ ftyp ++ ")) => Z.HasField \"" ++ fname ++ "\" " ++ rtyp ++ " aplg where\n" ++
