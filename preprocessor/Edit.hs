@@ -274,7 +274,29 @@ isRankNFieldType :: String -> Bool
 isRankNFieldType t = "forall" `isPrefixOf` dropWhile isSpace t
 
 editAddInstances :: [String] -> [PL] -> [PL]
-editAddInstances largeRecordNames xs = xs ++ concatMap (\x -> [nl $ mkPL "", mkPL x])
+editAddInstances largeRecordNames xs =
+    -- Emit each record's HasField instances immediately AFTER that record's own
+    -- top-level declaration, rather than appending them all at end-of-file. A
+    -- trailing top-level Template Haskell splice (e.g.
+    -- @$(deriveTypeableAndDataRecursively ''T)@) starts a new GHC declaration
+    -- group, and instances defined in a later group are NOT visible to earlier
+    -- groups. EOF-appended instances would therefore be hidden from any record-dot
+    -- field access occurring before such a splice. Interleaving keeps a record's
+    -- instances in the same declaration group as the record itself.
+    concatMap (\decl -> decl ++ genInstances largeRecordNames (parseRecords decl)) (groupTopLevelDecls xs)
+  where
+    -- Split the top-level token stream into per-declaration groups. Each group
+    -- begins at a column-1 lexeme (a new top-level declaration); continuation
+    -- lines and nested constructs are indented (col > 1) and stay in the group.
+    groupTopLevelDecls :: [PL] -> [[PL]]
+    groupTopLevelDecls [] = []
+    groupTopLevelDecls (y:ys) = (y : same) : groupTopLevelDecls rest
+      where (same, rest) = break ((== 1) . startCol) ys
+    startCol (Item l)      = col l
+    startCol (Paren o _ _) = col o
+
+genInstances :: [String] -> [Record] -> [PL]
+genInstances largeRecordNames records = concatMap (\x -> [nl $ mkPL "", nl $ mkPL x])
     [ seq (dumpInstance modNameStr instStr) $
       "instance (aplg ~ (" ++ ftyp ++ ")) => Z.HasField \"" ++ fname ++ "\" " ++ rtyp ++ " aplg " ++
       "where hasField _r = (\\_x -> case _r of {" ++ intercalate " ; "
@@ -316,8 +338,6 @@ editAddInstances largeRecordNames xs = xs ++ concatMap (\x -> [nl $ mkPL "", mkP
                         | Ctor cname fields <- ctors, fname `elem` map fst fields] ++
                       "}, " ++ fname ++ " _r)"
     ]
-    where
-        records = parseRecords xs
 
 -- | Represent a record, ignoring constructors. For example:
 --
